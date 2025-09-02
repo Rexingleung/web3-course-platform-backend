@@ -1,1 +1,214 @@
-import { getConnection } from '../database/connection';\nimport { getContract } from '../contracts/CourseContract';\nimport { Course, Purchase } from '../types/Course';\nimport { RowDataPacket } from 'mysql2';\n\nexport class CourseService {\n  private getDb() {\n    return getConnection();\n  }\n\n  private getContractInstance() {\n    return getContract();\n  }\n\n  async syncCourseFromContract(courseId: number): Promise<Course | null> {\n    try {\n      const contract = this.getContractInstance();\n      if (!contract) {\n        console.warn('Smart contract not available');\n        return null;\n      }\n\n      const courseData = await contract.getCourse(courseId);\n      \n      const course: Course = {\n        courseId,\n        title: courseData[0],\n        description: courseData[1],\n        author: courseData[2],\n        price: courseData[3].toString(),\n        createdAt: Number(courseData[4])\n      };\n\n      // Save to database\n      await this.saveCourse(course);\n      return course;\n    } catch (error) {\n      console.error('Failed to sync course from contract:', error);\n      return null;\n    }\n  }\n\n  async saveCourse(course: Course): Promise<void> {\n    const db = this.getDb();\n    const query = `\n      INSERT INTO courses (course_id, title, description, author, price, created_at)\n      VALUES (?, ?, ?, ?, ?, ?)\n      ON DUPLICATE KEY UPDATE\n        title = VALUES(title),\n        description = VALUES(description),\n        author = VALUES(author),\n        price = VALUES(price),\n        created_at = VALUES(created_at)\n    `;\n\n    await db.execute(query, [\n      course.courseId,\n      course.title,\n      course.description,\n      course.author,\n      course.price,\n      course.createdAt\n    ]);\n  }\n\n  async getAllCourses(): Promise<Course[]> {\n    const db = this.getDb();\n    const [rows] = await db.execute('SELECT * FROM courses ORDER BY created_at DESC');\n    return rows as Course[];\n  }\n\n  async getCourseById(courseId: number): Promise<Course | null> {\n    const db = this.getDb();\n    const [rows] = await db.execute(\n      'SELECT * FROM courses WHERE course_id = ?',\n      [courseId]\n    ) as [RowDataPacket[], any];\n\n    if (rows.length === 0) {\n      // Try to sync from contract if available\n      return await this.syncCourseFromContract(courseId);\n    }\n\n    return rows[0] as Course;\n  }\n\n  async getCoursesByAuthor(author: string): Promise<Course[]> {\n    const db = this.getDb();\n    const [rows] = await db.execute(\n      'SELECT * FROM courses WHERE author = ? ORDER BY created_at DESC',\n      [author.toLowerCase()]\n    );\n    return rows as Course[];\n  }\n\n  async getUserPurchasedCourses(userAddress: string): Promise<Course[]> {\n    try {\n      const contract = this.getContractInstance();\n      if (!contract) {\n        console.warn('Smart contract not available, falling back to database');\n        return await this.getUserPurchasedCoursesFromDB(userAddress);\n      }\n\n      const courseIds = await contract.getUserPurchasedCourses(userAddress);\n      const courses: Course[] = [];\n\n      for (const courseId of courseIds) {\n        const course = await this.getCourseById(Number(courseId));\n        if (course) {\n          courses.push(course);\n        }\n      }\n\n      return courses;\n    } catch (error) {\n      console.error('Failed to get user purchased courses from contract, falling back to database:', error);\n      return await this.getUserPurchasedCoursesFromDB(userAddress);\n    }\n  }\n\n  private async getUserPurchasedCoursesFromDB(userAddress: string): Promise<Course[]> {\n    const db = this.getDb();\n    const query = `\n      SELECT DISTINCT c.* FROM courses c\n      INNER JOIN purchases p ON c.course_id = p.course_id\n      WHERE p.buyer = ?\n      ORDER BY p.purchased_at DESC\n    `;\n    \n    const [rows] = await db.execute(query, [userAddress.toLowerCase()]);\n    return rows as Course[];\n  }\n\n  async hasUserPurchasedCourse(courseId: number, userAddress: string): Promise<boolean> {\n    try {\n      const contract = this.getContractInstance();\n      if (!contract) {\n        return await this.hasUserPurchasedCourseFromDB(courseId, userAddress);\n      }\n\n      return await contract.hasUserPurchasedCourse(courseId, userAddress);\n    } catch (error) {\n      console.error('Failed to check purchase status from contract, checking database:', error);\n      return await this.hasUserPurchasedCourseFromDB(courseId, userAddress);\n    }\n  }\n\n  private async hasUserPurchasedCourseFromDB(courseId: number, userAddress: string): Promise<boolean> {\n    const db = this.getDb();\n    const [rows] = await db.execute(\n      'SELECT id FROM purchases WHERE course_id = ? AND buyer = ? LIMIT 1',\n      [courseId, userAddress.toLowerCase()]\n    ) as [RowDataPacket[], any];\n\n    return rows.length > 0;\n  }\n\n  async recordPurchase(purchase: Purchase): Promise<void> {\n    const db = this.getDb();\n    const query = `\n      INSERT INTO purchases (course_id, buyer, price, transaction_hash)\n      VALUES (?, ?, ?, ?)\n    `;\n\n    await db.execute(query, [\n      purchase.courseId,\n      purchase.buyer.toLowerCase(),\n      purchase.price,\n      purchase.transactionHash\n    ]);\n  }\n\n  async getCourseCount(): Promise<number> {\n    try {\n      const contract = this.getContractInstance();\n      if (!contract) {\n        // Fall back to database count\n        const db = this.getDb();\n        const [rows] = await db.execute('SELECT COUNT(*) as count FROM courses') as [RowDataPacket[], any];\n        return rows[0].count || 0;\n      }\n\n      const count = await contract.getCourseCount();\n      return Number(count);\n    } catch (error) {\n      console.error('Failed to get course count from contract, using database:', error);\n      const db = this.getDb();\n      const [rows] = await db.execute('SELECT COUNT(*) as count FROM courses') as [RowDataPacket[], any];\n      return rows[0].count || 0;\n    }\n  }\n\n  async syncAllCourses(): Promise<void> {\n    try {\n      const contract = this.getContractInstance();\n      if (!contract) {\n        console.warn('Smart contract not available, cannot sync courses');\n        return;\n      }\n\n      const count = await this.getCourseCount();\n      let synced = 0;\n      \n      for (let i = 1; i <= count; i++) {\n        const result = await this.syncCourseFromContract(i);\n        if (result) synced++;\n      }\n      \n      console.log(`Synced ${synced}/${count} courses from contract`);\n    } catch (error) {\n      console.error('Failed to sync all courses:', error);\n    }\n  }\n}
+import { getConnection } from '../database/connection';
+import { getContract } from '../contracts/CourseContract';
+import { Course, Purchase } from '../types/Course';
+import { RowDataPacket } from 'mysql2';
+
+export class CourseService {
+  private getDb() {
+    return getConnection();
+  }
+
+  private getContractInstance() {
+    return getContract();
+  }
+
+  async syncCourseFromContract(courseId: number): Promise<Course | null> {
+    try {
+      const contract = this.getContractInstance();
+      if (!contract) {
+        console.warn('Smart contract not available');
+        return null;
+      }
+
+      const courseData = await contract.getCourse(courseId);
+      
+      const course: Course = {
+        courseId,
+        title: courseData[0],
+        description: courseData[1],
+        author: courseData[2],
+        price: courseData[3].toString(),
+        createdAt: Number(courseData[4])
+      };
+
+      // Save to database
+      await this.saveCourse(course);
+      return course;
+    } catch (error) {
+      console.error('Failed to sync course from contract:', error);
+      return null;
+    }
+  }
+
+  async saveCourse(course: Course): Promise<void> {
+    const db = this.getDb();
+    const query = `
+      INSERT INTO courses (course_id, title, description, author, price, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        title = VALUES(title),
+        description = VALUES(description),
+        author = VALUES(author),
+        price = VALUES(price),
+        created_at = VALUES(created_at)
+    `;
+
+    await db.execute(query, [
+      course.courseId,
+      course.title,
+      course.description,
+      course.author,
+      course.price,
+      course.createdAt
+    ]);
+  }
+
+  async getAllCourses(): Promise<Course[]> {
+    const db = this.getDb();
+    const [rows] = await db.execute('SELECT * FROM courses ORDER BY created_at DESC');
+    return rows as Course[];
+  }
+
+  async getCourseById(courseId: number): Promise<Course | null> {
+    const db = this.getDb();
+    const [rows] = await db.execute(
+      'SELECT * FROM courses WHERE course_id = ?',
+      [courseId]
+    ) as [RowDataPacket[], any];
+
+    if (rows.length === 0) {
+      // Try to sync from contract if available
+      return await this.syncCourseFromContract(courseId);
+    }
+
+    return rows[0] as Course;
+  }
+
+  async getCoursesByAuthor(author: string): Promise<Course[]> {
+    const db = this.getDb();
+    const [rows] = await db.execute(
+      'SELECT * FROM courses WHERE author = ? ORDER BY created_at DESC',
+      [author.toLowerCase()]
+    );
+    return rows as Course[];
+  }
+
+  async getUserPurchasedCourses(userAddress: string): Promise<Course[]> {
+    try {
+      const contract = this.getContractInstance();
+      if (!contract) {
+        console.warn('Smart contract not available, falling back to database');
+        return await this.getUserPurchasedCoursesFromDB(userAddress);
+      }
+
+      const courseIds = await contract.getUserPurchasedCourses(userAddress);
+      const courses: Course[] = [];
+
+      for (const courseId of courseIds) {
+        const course = await this.getCourseById(Number(courseId));
+        if (course) {
+          courses.push(course);
+        }
+      }
+
+      return courses;
+    } catch (error) {
+      console.error('Failed to get user purchased courses from contract, falling back to database:', error);
+      return await this.getUserPurchasedCoursesFromDB(userAddress);
+    }
+  }
+
+  private async getUserPurchasedCoursesFromDB(userAddress: string): Promise<Course[]> {
+    const db = this.getDb();
+    const query = `
+      SELECT DISTINCT c.* FROM courses c
+      INNER JOIN purchases p ON c.course_id = p.course_id
+      WHERE p.buyer = ?
+      ORDER BY p.purchased_at DESC
+    `;
+    
+    const [rows] = await db.execute(query, [userAddress.toLowerCase()]);
+    return rows as Course[];
+  }
+
+  async hasUserPurchasedCourse(courseId: number, userAddress: string): Promise<boolean> {
+    try {
+      const contract = this.getContractInstance();
+      if (!contract) {
+        return await this.hasUserPurchasedCourseFromDB(courseId, userAddress);
+      }
+
+      return await contract.hasUserPurchasedCourse(courseId, userAddress);
+    } catch (error) {
+      console.error('Failed to check purchase status from contract, checking database:', error);
+      return await this.hasUserPurchasedCourseFromDB(courseId, userAddress);
+    }
+  }
+
+  private async hasUserPurchasedCourseFromDB(courseId: number, userAddress: string): Promise<boolean> {
+    const db = this.getDb();
+    const [rows] = await db.execute(
+      'SELECT id FROM purchases WHERE course_id = ? AND buyer = ? LIMIT 1',
+      [courseId, userAddress.toLowerCase()]
+    ) as [RowDataPacket[], any];
+
+    return rows.length > 0;
+  }
+
+  async recordPurchase(purchase: Purchase): Promise<void> {
+    const db = this.getDb();
+    const query = `
+      INSERT INTO purchases (course_id, buyer, price, transaction_hash)
+      VALUES (?, ?, ?, ?)
+    `;
+
+    await db.execute(query, [
+      purchase.courseId,
+      purchase.buyer.toLowerCase(),
+      purchase.price,
+      purchase.transactionHash
+    ]);
+  }
+
+  async getCourseCount(): Promise<number> {
+    try {
+      const contract = this.getContractInstance();
+      if (!contract) {
+        // Fall back to database count
+        const db = this.getDb();
+        const [rows] = await db.execute('SELECT COUNT(*) as count FROM courses') as [RowDataPacket[], any];
+        return rows[0].count || 0;
+      }
+
+      const count = await contract.getCourseCount();
+      return Number(count);
+    } catch (error) {
+      console.error('Failed to get course count from contract, using database:', error);
+      const db = this.getDb();
+      const [rows] = await db.execute('SELECT COUNT(*) as count FROM courses') as [RowDataPacket[], any];
+      return rows[0].count || 0;
+    }
+  }
+
+  async syncAllCourses(): Promise<void> {
+    try {
+      const contract = this.getContractInstance();
+      if (!contract) {
+        console.warn('Smart contract not available, cannot sync courses');
+        return;
+      }
+
+      const count = await this.getCourseCount();
+      let synced = 0;
+      
+      for (let i = 1; i <= count; i++) {
+        const result = await this.syncCourseFromContract(i);
+        if (result) synced++;
+      }
+      
+      console.log(`Synced ${synced}/${count} courses from contract`);
+    } catch (error) {
+      console.error('Failed to sync all courses:', error);
+    }
+  }
+}
